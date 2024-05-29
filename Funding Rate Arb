@@ -1,0 +1,275 @@
+import asyncio
+import websockets
+import json
+import requests
+import time
+import hmac
+import hashlib
+import base64
+import uuid
+from datetime import datetime, timedelta
+import nest_asyncio
+
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
+
+# Constants and Utilities
+API_KEY = ''
+API_SECRET = ''
+API_PASSPHRASE = ''
+TRADE_AMOUNT_USDT = 15  # Total trade amount in USDT including leverage
+LEVERAGE = 8  # Set your leverage here
+MIN_FUNDING_RATE = 0.003  # Minimum funding rate (0.5%) to cover fees and slippage
+LOT_SIZE = 10000  # Each lot equals 10,000 WOJAK
+
+def create_signature(timestamp, method, endpoint, body, secret):
+    str_to_sign = str(timestamp) + method + endpoint + body
+    signature = base64.b64encode(
+        hmac.new(secret.encode(), str_to_sign.encode(), hashlib.sha256).digest()
+    )
+    return signature
+
+def get_headers(api_key, api_secret, api_passphrase, method, endpoint, body=''):
+    timestamp = str(int(time.time() * 1000))
+    signature = create_signature(timestamp, method, endpoint, body, api_secret)
+    passphrase = base64.b64encode(
+        hmac.new(api_secret.encode('utf-8'), api_passphrase.encode('utf-8'), hashlib.sha256).digest()
+    ).decode('utf-8')
+    return {
+        'Content-Type': 'application/json',
+        'KC-API-SIGN': signature,
+        'KC-API-TIMESTAMP': timestamp,
+        'KC-API-KEY': api_key,
+        'KC-API-PASSPHRASE': passphrase,
+        'KC-API-KEY-VERSION': '2'
+    }
+
+def fetch_latest_price(symbol, api_key, api_secret, api_passphrase):
+    try:
+        headers = get_headers(api_key, api_secret, api_passphrase, 'GET', '')
+        url = f'https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}'
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()['data']
+        return float(data['price']), float(data['bestBidPrice']), float(data['bestAskPrice'])
+    except requests.RequestException as e:
+        print(f"Failed to fetch latest price for {symbol}: {str(e)}")
+        return None, None, None
+
+def fetch_contracts_and_rates(api_key, api_secret, api_passphrase):
+    try:
+        endpoint = "/api/v1/contracts/active"
+        method = "GET"
+        headers = get_headers(api_key, api_secret, api_passphrase, method, endpoint)
+        url = f"https://api-futures.kucoin.com{endpoint}"
+
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json().get('data', [])
+        print("Successfully fetched contracts data.")
+        return data
+    except requests.RequestException as e:
+        print(f"Failed to fetch contracts data from KuCoin: {str(e)}")
+        return []
+
+def fetch_current_funding_rate(api_key, api_secret, api_passphrase, symbol):
+    try:
+        endpoint = f"/api/v1/funding-rate/{symbol}/current"
+        method = "GET"
+        headers = get_headers(api_key, api_secret, api_passphrase, method, endpoint)
+        url = f"https://api-futures.kucoin.com{endpoint}"
+
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json().get('data', {})
+        if 'value' in data:
+            print(f"Successfully fetched current funding rate data for {symbol}. Current rate: {data['value']}, Predicted rate: {data['predictedValue']}")
+            return data
+        else:
+            print(f"Current rate data is not available for {symbol}.")
+            return None
+    except requests.RequestException as e:
+        print(f"Failed to fetch current funding rate data for {symbol}: {str(e)}")
+        return None
+
+def execute_trade(api_key, api_secret, api_passphrase, symbol, side, size, price, leverage=20):
+    try:
+        client_oid = str(uuid.uuid4())
+        endpoint = "/api/v1/orders"
+        body = json.dumps({
+            "clientOid": client_oid,
+            "symbol": symbol,
+            "type": "limit",
+            "side": side,
+            "size": str(size),
+            "price": str(price),
+            "leverage": leverage
+        })
+        headers = get_headers(api_key, api_secret, api_passphrase, 'POST', endpoint, body)
+        url = f"https://api-futures.kucoin.com{endpoint}"
+
+        response = requests.post(url, headers=headers, data=body)
+        response.raise_for_status()
+        print(f"Limit order placed for {symbol} on {side} side at price {price}. Details: {response.json()}")
+        return response.json().get('data', {}).get('orderId')
+    except requests.RequestException as e:
+        print(f"Failed to place limit order on {symbol}: {str(e)}")
+        return None
+
+def close_position(api_key, api_secret, api_passphrase, symbol, side, size, exit_price, leverage=20):
+    try:
+        client_oid = str(uuid.uuid4())
+        endpoint = "/api/v1/orders"
+        body = json.dumps({
+            "clientOid": client_oid,
+            "symbol": symbol,
+            "type": "limit",
+            "side": side,
+            "size": str(size),
+            "price": str(exit_price),
+            "leverage": leverage
+        })
+        headers = get_headers(api_key, api_secret, api_passphrase, 'POST', endpoint, body)
+        url = f"https://api-futures.kucoin.com{endpoint}"
+
+        response = requests.post(url, headers=headers, data=body)
+        response.raise_for_status()
+        print(f"Limit order placed to close position for {symbol} on {side} side at price {exit_price}. Details: {response.json()}")
+        return response.json().get('data', {}).get('orderId')
+    except requests.RequestException as e:
+        print(f"Failed to place limit order to close position on {symbol}: {str(e)}")
+        return None
+
+async def subscribe_to_announcements(symbol, api_key, api_secret, api_passphrase):
+    try:
+        # Authenticate WebSocket connection
+        endpoint = "/api/v1/bullet-public"
+        headers = get_headers(api_key, api_secret, api_passphrase, 'POST', endpoint)
+        url = f"https://api-futures.kucoin.com{endpoint}"
+
+        response = requests.post(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        token = data['data']['token']
+        instance_server = data['data']['instanceServers'][0]
+        ws_url = instance_server['endpoint']
+        ping_interval = instance_server['pingInterval'] / 1000
+
+        async with websockets.connect(f"{ws_url}?token={token}") as websocket:
+            connect_id = str(uuid.uuid4())
+            await websocket.send(json.dumps({
+                "id": connect_id,
+                "type": "subscribe",
+                "topic": "/contract/announcement",
+                "response": True
+            }))
+
+            async def keep_alive():
+                while True:
+                    await asyncio.sleep(ping_interval)
+                    await websocket.send(json.dumps({"id": connect_id, "type": "ping"}))
+
+            asyncio.create_task(keep_alive())
+
+            position_opened = False
+            order_id = None
+            entry_price = None
+            direction = None
+            position_size = None
+
+            while True:
+                response = await websocket.recv()
+                data = json.loads(response)
+                if data['type'] == 'message' and 'data' in data:
+                    topic = data['topic']
+                    subject = data['subject']
+                    announcement_data = data['data']
+                    if topic == "/contract/announcement":
+                        if subject == "funding.begin":
+                            # Enter the position 5 seconds before settlement
+                            _, best_bid, best_ask = fetch_latest_price(symbol, api_key, api_secret, api_passphrase)
+                            if best_bid and best_ask:
+                                direction = 'buy' if float(announcement_data['fundingRate']) > 0 else 'sell'
+                                price = best_ask if direction == 'buy' else best_bid
+                                position_size = round((TRADE_AMOUNT_USDT * LEVERAGE) / price / LOT_SIZE)
+                                order_id = execute_trade(api_key, api_secret, api_passphrase, symbol, direction, position_size, price, LEVERAGE)
+                                entry_price = price
+                                position_opened = True
+                                print(f"Position opened for {symbol} at price {price} with size {position_size}.")
+
+                        elif subject == "funding.end" and position_opened:
+                            # Exit the position after settlement
+                            if entry_price is not None:
+                                exit_direction = 'sell' if direction == 'buy' else 'buy'
+                                close_position(api_key, api_secret, api_passphrase, symbol, exit_direction, position_size, entry_price, LEVERAGE)
+                                print(f"Position closed for {symbol} at entry price {entry_price} with size {position_size}.")
+                                position_opened = False
+
+    except Exception as e:
+        print(f"An error occurred in WebSocket connection: {str(e)}")
+        await asyncio.sleep(5)
+
+def countdown_to_settlement(next_settlement_time):
+    while datetime.now() < next_settlement_time - timedelta(seconds=5):
+        remaining_time = next_settlement_time - datetime.now()
+        print(f"\rCountdown to next settlement: {remaining_time}", end="", flush=True)
+        time.sleep(1)
+    print("")
+
+def monitor_and_manage_positions(api_key, api_secret, api_passphrase):
+    current_order_id = None
+    current_symbol = None
+    next_settlement_time = None
+
+    while True:
+        try:
+            if not next_settlement_time or datetime.now() >= next_settlement_time:
+                contracts = fetch_contracts_and_rates(api_key, api_secret, api_passphrase)
+                if contracts:
+                    rates_and_contracts = []
+                    for contract in contracts:
+                        funding_rate_info = fetch_current_funding_rate(api_key, api_secret, api_passphrase, contract['symbol'])
+                        if funding_rate_info:
+                            rates_and_contracts.append({
+                                'symbol': contract['symbol'],
+                                'value': funding_rate_info['value'],
+                                'next_settlement_time': datetime.fromtimestamp(funding_rate_info['timePoint'] / 1000 + funding_rate_info['granularity'] / 1000)
+                            })
+
+                    if rates_and_contracts:
+                        rates_and_contracts_sorted = sorted(rates_and_contracts, key=lambda x: abs(float(x['value'])), reverse=True)
+                        print("All pairs sorted by funding rates from highest to lowest:")
+                        for item in rates_and_contracts_sorted:
+                            print(f"Symbol: {item['symbol']}, Funding Rate: {item['value']}, Next Settlement: {item['next_settlement_time']}")
+
+                        best_contract = next((contract for contract in rates_and_contracts_sorted if abs(float(contract['value'])) >= MIN_FUNDING_RATE), None)
+
+                        if best_contract:
+                            next_settlement_time = best_contract['next_settlement_time']
+                            countdown_to_settlement(next_settlement_time)
+
+                            direction = 'sell' if float(best_contract['value']) > 0 else 'buy'
+                            _, best_bid, best_ask = fetch_latest_price(best_contract['symbol'], api_key, api_secret, api_passphrase)
+                            if direction == 'buy':
+                                price = best_ask
+                            else:
+                                price = best_bid
+
+                            if best_bid and best_ask:
+                                position_size = round((TRADE_AMOUNT_USDT * LEVERAGE) / price / LOT_SIZE)
+                                current_order_id = execute_trade(api_key, api_secret, api_passphrase, best_contract['symbol'], direction, position_size, price, LEVERAGE)
+                                current_symbol = best_contract['symbol']
+                                print(f"New position opened for {current_symbol} with direction {direction} and size {position_size} at price {price}.")
+
+                                asyncio.run(subscribe_to_announcements(best_contract['symbol'], api_key, api_secret, api_passphrase))
+
+            time.sleep(10)  # Sleep for 10 seconds before checking again
+        except Exception as e:
+            print(f"An error occurred: {str(e)}")
+            time.sleep(10)  # Wait before retrying in case of an error
+
+def main():
+    monitor_and_manage_positions(API_KEY, API_SECRET, API_PASSPHRASE)
+
+if __name__ == "__main__":
+    main()
